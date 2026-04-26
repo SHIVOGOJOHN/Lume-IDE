@@ -302,6 +302,7 @@ class LuauIDE:
         self.root.geometry("1480x920")
         self.root.minsize(1120, 720)
         self.root.configure(bg=BG)
+        self._set_startup_window_mode()
 
         self.project_root = Path.cwd()
         self.appdata_root = self._appdata_root_path()
@@ -412,6 +413,7 @@ class LuauIDE:
 
         self._apply_loaded_state()
         self._apply_startup_editor_focus_layout()
+        self.root.after_idle(self._set_startup_window_mode)
         self._ensure_luau_runtime_async()
 
     def _configure_style(self):
@@ -486,6 +488,24 @@ class LuauIDE:
             selectbackground=[("readonly", "#111827")],
             selectforeground=[("readonly", "#e5e7eb")],
         )
+
+    def _set_startup_window_mode(self):
+        try:
+            self.root.state("zoomed")
+            return
+        except tk.TclError:
+            pass
+        try:
+            self.root.attributes("-zoomed", True)
+            return
+        except tk.TclError:
+            pass
+        try:
+            width = self.root.winfo_screenwidth()
+            height = self.root.winfo_screenheight()
+            self.root.geometry(f"{width}x{height}+0+0")
+        except tk.TclError:
+            pass
 
     def _resource_path(self, name):
         candidates = []
