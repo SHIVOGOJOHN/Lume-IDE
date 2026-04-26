@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+Output/
+*.exe
+
+luau_ide.build/
+luau_ide.dist/
+luau_ide.onefile-build/
+
+material_icon_theme_src/
+material_icon_theme_pkg/
+.icon_build/
+material-icon-theme-*.tgz

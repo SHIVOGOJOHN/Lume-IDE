@@ -1,0 +1,43 @@
+{
+  "project_root": "C:\\Users\\adm\\.vscode\\Roblox",
+  "open_tabs": [
+    {
+      "path": "C:\\Users\\adm\\.vscode\\Roblox\\src\\shared\\Beginner\\5_tables\\main.luau",
+      "pane": "main"
+    }
+  ],
+  "selected_main_tab": "C:\\Users\\adm\\.vscode\\Roblox\\src\\shared\\Beginner\\5_tables\\main.luau",
+  "selected_split_tab": "",
+  "active_editor_pane": "main",
+  "shell": "PowerShell",
+  "code_font_size": 8,
+  "term_font_size": 9,
+  "luau_path": "C:\\luau\\luau.exe",
+  "recent_files": [
+    "C:\\Users\\adm\\.vscode\\Roblox\\src\\shared\\Beginner\\5_tables\\main.luau",
+    "C:\\Users\\adm\\.vscode\\Roblox\\src\\shared\\Hello.luau",
+    "C:\\Users\\adm\\.vscode\\Roblox\\sourcemap.json",
+    "C:\\Users\\adm\\.vscode\\Roblox\\selene.toml",
+    "C:\\Users\\adm\\.vscode\\Roblox\\src\\server\\init.server.luau",
+    "C:\\Users\\adm\\.vscode\\Roblox\\src\\shared\\test.luau",
+    "C:\\Users\\adm\\.vscode\\Roblox\\wally.toml",
+    "C:\\Users\\adm\\.vscode\\Roblox\\src\\shared\\Beginner\\Test\\test.luau"
+  ],
+  "terminal_sessions": [
+    {
+      "title": "Terminal 2",
+      "shell": "PowerShell",
+      "cwd": "C:\\Users\\adm\\.vscode\\Roblox",
+      "history": [],
+      "pending_input": ""
+    }
+  ],
+  "active_terminal_index": 0,
+  "sidebar_visible": true,
+  "panels_visible": true,
+  "outline_visible": false,
+  "split_visible": false,
+  "sidebar_sash": 300,
+  "editor_sash": 280,
+  "bottom_sash": 420
+}

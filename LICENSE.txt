@@ -1,0 +1,4 @@
+﻿License for Lume has not been finalized yet.
+
+Replace this file with the license you intend to ship before public distribution.
+If you do not want to open-source the application, replace this with your proprietary license terms.

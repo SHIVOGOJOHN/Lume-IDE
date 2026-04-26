@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Luau Electron IDE</title>
+    <link rel="stylesheet" href="../node_modules/xterm/css/xterm.css" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header id="titlebar">
+        <div class="title-block">
+          <span class="title-mark"></span>
+          <div>
+            <div class="title-text">Luau Electron IDE</div>
+            <div class="title-subtext" id="title-project">No folder open</div>
+          </div>
+        </div>
+        <div class="title-actions">
+          <button class="ghost-button" id="set-luau-path-button">Set `luau.exe`</button>
+        </div>
+      </header>
+
+      <nav id="toolbar"></nav>
+
+      <main id="workspace">
+        <aside id="sidebar">
+          <div class="panel-titlebar">
+            <div>
+              <div class="panel-title">Explorer</div>
+              <div class="panel-subtitle" id="folder-label">No folder open</div>
+            </div>
+            <div class="titlebar-actions">
+              <button class="icon-button" data-action="new-file" title="New File"></button>
+              <button class="icon-button" data-action="new-folder" title="New Folder"></button>
+              <button class="icon-button" data-action="rename-path" title="Rename"></button>
+              <button class="icon-button" data-action="delete-path" title="Delete"></button>
+            </div>
+          </div>
+          <div id="explorer-tree"></div>
+        </aside>
+
+        <div class="splitter vertical" id="sidebar-splitter"></div>
+
+        <section id="main-column">
+          <section id="editor-shell">
+            <div class="panel-titlebar thin">
+              <div>
+                <div class="panel-title">Editor</div>
+                <div class="panel-subtitle" id="breadcrumb">No file selected</div>
+              </div>
+              <div class="titlebar-actions">
+                <span class="diagnostics" id="diagnostics">Diagnostics ready</span>
+                <button class="ghost-button compact" id="split-active-button">Split</button>
+              </div>
+            </div>
+
+            <div id="editor-layout">
+              <section class="editor-group" data-group="main">
+                <div class="tabbar" id="tabbar-main"></div>
+                <div class="editor-host" id="editor-main"></div>
+              </section>
+
+              <div class="splitter vertical hidden" id="editor-splitter"></div>
+
+              <section class="editor-group hidden" data-group="split">
+                <div class="tabbar" id="tabbar-split"></div>
+                <div class="editor-host" id="editor-split"></div>
+              </section>
+
+              <aside id="outline-panel">
+                <div class="panel-titlebar thin">
+                  <div>
+                    <div class="panel-title">Outline</div>
+                    <div class="panel-subtitle" id="outline-count">0 symbols</div>
+                  </div>
+                </div>
+                <div id="outline-list"></div>
+              </aside>
+            </div>
+          </section>
+
+          <div class="splitter horizontal" id="panels-splitter"></div>
+
+          <section id="panels-shell">
+            <div class="panel-titlebar ultra-thin">
+              <div>
+                <div class="panel-title">Panels</div>
+              </div>
+              <div class="titlebar-actions">
+                <label class="shell-select-wrap">
+                  <span>Shell</span>
+                  <select id="shell-select"></select>
+                </label>
+                <span class="panel-cwd" id="panel-cwd"></span>
+                <button class="ghost-button compact danger" id="hide-panels-button">x</button>
+              </div>
+            </div>
+
+            <div id="panels-layout">
+              <section class="panel-surface">
+                <div class="panel-titlebar ultra-thin">
+                  <div class="panel-title">Terminal</div>
+                  <div class="titlebar-actions">
+                    <button class="ghost-button compact" id="restart-shell-button">Restart</button>
+                  </div>
+                </div>
+                <div id="terminal"></div>
+              </section>
+
+              <div class="splitter vertical" id="terminal-output-splitter"></div>
+
+              <section class="panel-surface">
+                <div class="panel-titlebar ultra-thin">
+                  <div class="panel-title">Run Output</div>
+                  <div class="panel-subtitle" id="run-status">Idle</div>
+                </div>
+                <pre id="run-output"></pre>
+              </section>
+            </div>
+          </section>
+        </section>
+      </main>
+
+      <footer id="statusbar">
+        <span id="status-text">Ready</span>
+        <span id="cursor-text">Ln 1, Col 1</span>
+      </footer>
+    </div>
+
+    <div id="palette-overlay" class="overlay hidden">
+      <div class="palette">
+        <input id="palette-input" autocomplete="off" spellcheck="false" />
+        <div id="palette-list"></div>
+      </div>
+    </div>
+
+    <div id="context-menu" class="context-menu hidden"></div>
+
+    <script src="../node_modules/monaco-editor/min/vs/loader.js"></script>
+    <script src="../node_modules/xterm/lib/xterm.js"></script>
+    <script src="../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+    <script src="./renderer.js"></script>
+  </body>
+</html>
