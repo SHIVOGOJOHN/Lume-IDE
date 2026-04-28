@@ -18,3 +18,5 @@
 - Current strategy: manual update check.
 - Publish a new installer or executable for each release.
 - Update the version in `luau_ide.py` and `build_lume_nuitka.cmd` before shipping.
+
+

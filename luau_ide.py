@@ -11,15 +11,40 @@ import io
 import logging
 import os
 import sys
+import time
 import webbrowser
 import urllib.error
 import urllib.request
 import zipfile
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 import tkinter as tk
+from ctypes import wintypes
 from tkinter import font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
+
+try:
+    from groq import Groq as GroqClient
+except ImportError:
+    GroqClient = None
+
+try:
+    from anthropic import Anthropic as AnthropicClient
+except ImportError:
+    AnthropicClient = None
+
+try:
+    from google import genai as google_genai
+    from google.genai import types as google_genai_types
+except ImportError:
+    google_genai = None
+    google_genai_types = None
+
+try:
+    from openai import OpenAI as OpenAIClient
+except ImportError:
+    OpenAIClient = None
 
 BG = "#16181d"
 PANEL_BG = "#1b1f27"
@@ -246,6 +271,19 @@ FONT_UI = ("Segoe UI", 10)
 DEFAULT_CODE_FONT_SIZE = 10
 DEFAULT_TERM_FONT_SIZE = 10
 DEFAULT_TAB_WIDTH = 4
+DEFAULT_AI_DEBOUNCE_MS = 220
+DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_ANTHROPIC_MODEL = "claude-opus-4-7"
+DEFAULT_OPENAI_MODEL = "gpt-5.5"
+AI_CONTEXT_BEFORE_CHARS = 1400
+AI_CONTEXT_AFTER_CHARS = 240
+AI_MAX_OUTPUT_TOKENS = 48
+AI_PROVIDER_BACKOFF_SECONDS = 90
+AI_PROVIDER_FORBIDDEN_BACKOFF_SECONDS = 600
+AI_HINT_PREVIEW_CHARS = 72
+AI_API_TIMEOUT_SECONDS = 18
+AI_WORD_TRIGGER_MIN = 2
 AUTO_PAIRS = {
     "(": ")",
     "{": "}",
@@ -295,12 +333,38 @@ class TerminalSession:
     pending_input: str = ""
 
 
+class _CREDENTIAL_ATTRIBUTEW(ctypes.Structure):
+    _fields_ = [
+        ("Keyword", wintypes.LPWSTR),
+        ("Flags", wintypes.DWORD),
+        ("ValueSize", wintypes.DWORD),
+        ("Value", ctypes.POINTER(ctypes.c_ubyte)),
+    ]
+
+
+class _CREDENTIALW(ctypes.Structure):
+    _fields_ = [
+        ("Flags", wintypes.DWORD),
+        ("Type", wintypes.DWORD),
+        ("TargetName", wintypes.LPWSTR),
+        ("Comment", wintypes.LPWSTR),
+        ("LastWritten", wintypes.FILETIME),
+        ("CredentialBlobSize", wintypes.DWORD),
+        ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)),
+        ("Persist", wintypes.DWORD),
+        ("AttributeCount", wintypes.DWORD),
+        ("Attributes", ctypes.POINTER(_CREDENTIAL_ATTRIBUTEW)),
+        ("TargetAlias", wintypes.LPWSTR),
+        ("UserName", wintypes.LPWSTR),
+    ]
+
+
 class LuauIDE:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_NAME)
         self.root.geometry("1480x920")
-        self.root.minsize(1120, 720)
+        self.root.minsize(760, 520)
         self.root.configure(bg=BG)
         self._set_startup_window_mode()
 
@@ -344,6 +408,7 @@ class LuauIDE:
         self.sidebar_visible = True
         self.panels_visible = True
         self.outline_visible = True
+        self.top_chrome_visible = True
         self.git_bash_path = self._detect_git_bash()
         self.dragdrop_backend = self._detect_dragdrop_backend()
         self.lsp_executable = self._detect_lsp_executable()
@@ -367,6 +432,7 @@ class LuauIDE:
         self.completion_listbox = None
         self.completion_items = []
         self.completion_tab = None
+        self.completion_signature = ""
         self.notebook_close_target = None
         self.notebook_close_meta = None
         self.terminal_notebook_close_target = None
@@ -397,6 +463,44 @@ class LuauIDE:
         self.settings_window = None
         self.editor_tab_bars: dict[str, tk.Frame] = {}
         self.terminal_tab_bar = None
+        self.top_chrome_frame = tk.Frame(self.root, bg=PANEL_BG)
+        self.top_chrome_frame.pack(fill=tk.X, side=tk.TOP)
+        self.top_chrome_toggle_button = None
+        self.ai_completion_enabled = False
+        self.ai_completion_debounce_ms = DEFAULT_AI_DEBOUNCE_MS
+        self.groq_model_name = DEFAULT_GROQ_MODEL
+        self.gemini_model_name = DEFAULT_GEMINI_MODEL
+        self.anthropic_model_name = DEFAULT_ANTHROPIC_MODEL
+        self.openai_model_name = DEFAULT_OPENAI_MODEL
+        self.ai_completion_jobs: dict[str, str] = {}
+        self.ai_request_serial = 0
+        self.ai_latest_serial_by_tab: dict[str, int] = {}
+        self.ai_provider_cursor = 0
+        self.ai_provider_backoff_until = {"groq": 0.0, "gemini": 0.0}
+        self.ai_hint_label = None
+        self.ai_hint_tab = None
+        self.ai_hint_text = ""
+        self.ai_hint_insert_index = ""
+        self.ai_hint_full_text = ""
+        self.ai_hint_request_serial = 0
+        self.ai_hint_end_index = ""
+        self.ai_completion_cache: dict[str, tuple[str, str]] = {}
+        self.ai_last_signature_by_tab: dict[str, str] = {}
+        self.lsp_process = None
+        self.lsp_reader_thread = None
+        self.lsp_stderr_thread = None
+        self.lsp_lock = threading.RLock()
+        self.lsp_write_lock = threading.Lock()
+        self.lsp_pending_requests: dict[int, dict[str, object]] = {}
+        self.lsp_request_id = 0
+        self.lsp_initialized = False
+        self.lsp_document_versions: dict[str, int] = {}
+        self.lsp_document_text: dict[str, str] = {}
+        self.lsp_completion_jobs: dict[str, str] = {}
+        self.lsp_completion_cache: dict[str, list[dict[str, str]]] = {}
+        self.lsp_completion_serial = 0
+        self.lsp_latest_serial_by_tab: dict[str, int] = {}
+        self.lsp_last_signature_by_tab: dict[str, str] = {}
 
         self._configure_logging()
         self._configure_style()
@@ -410,6 +514,7 @@ class LuauIDE:
         self._build_statusbar()
         self._bind_shortcuts()
         self._setup_dragdrop()
+        self.root.bind_all("<ButtonPress-1>", self._on_global_pointer_down, add="+")
 
         self._apply_loaded_state()
         self._apply_startup_editor_focus_layout()
@@ -506,6 +611,108 @@ class LuauIDE:
             self.root.geometry(f"{width}x{height}+0+0")
         except tk.TclError:
             pass
+
+    def _set_top_chrome_visible(self, visible):
+        self.top_chrome_visible = bool(visible)
+        if self.top_chrome_visible:
+            pack_kwargs = {"fill": tk.X, "side": tk.TOP}
+            if hasattr(self, "outer_pane"):
+                pack_kwargs["before"] = self.outer_pane
+            self.top_chrome_frame.pack(**pack_kwargs)
+        else:
+            self.top_chrome_frame.pack_forget()
+        if self.top_chrome_toggle_button and self.top_chrome_toggle_button.winfo_exists():
+            label = "Chrome v" if self.top_chrome_visible else "Chrome >"
+            self.top_chrome_toggle_button.config(text=label)
+
+    def _toggle_top_chrome(self):
+        self._set_top_chrome_visible(not self.top_chrome_visible)
+        self._save_state()
+        self._set_status("Top chrome visible" if self.top_chrome_visible else "Top chrome hidden")
+
+    def _credential_target_name(self, provider):
+        return f"{APP_ID}.ai.{provider}"
+
+    def _fallback_api_env_name(self, provider):
+        return {
+            "groq": "LUME_GROQ_API_KEY",
+            "gemini": "LUME_GEMINI_API_KEY",
+            "anthropic": "LUME_ANTHROPIC_API_KEY",
+            "openai": "LUME_OPENAI_API_KEY",
+        }.get(provider, "")
+
+    def _read_secret(self, provider):
+        env_name = self._fallback_api_env_name(provider)
+        if env_name and os.getenv(env_name):
+            return os.getenv(env_name, "").strip()
+        if os.name != "nt":
+            return ""
+        try:
+            advapi32 = ctypes.windll.advapi32
+            credential = ctypes.POINTER(_CREDENTIALW)()
+            if not advapi32.CredReadW(self._credential_target_name(provider), 1, 0, ctypes.byref(credential)):
+                return ""
+            try:
+                blob_size = int(credential.contents.CredentialBlobSize)
+                if blob_size <= 0:
+                    return ""
+                blob = ctypes.string_at(credential.contents.CredentialBlob, blob_size)
+                return blob.decode("utf-16le").strip()
+            finally:
+                advapi32.CredFree(credential)
+        except Exception:
+            self._log_exception("Failed to read %s API key", provider)
+            return ""
+
+    def _write_secret(self, provider, secret):
+        secret = secret.strip()
+        if os.name != "nt":
+            return False
+        try:
+            blob = secret.encode("utf-16le")
+            blob_buffer = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob) if blob else None
+            credential = _CREDENTIALW()
+            credential.Flags = 0
+            credential.Type = 1
+            credential.TargetName = self._credential_target_name(provider)
+            credential.Comment = f"{APP_NAME} AI completion key"
+            credential.CredentialBlobSize = len(blob)
+            credential.CredentialBlob = ctypes.cast(blob_buffer, ctypes.POINTER(ctypes.c_ubyte)) if blob_buffer else None
+            credential.Persist = 2
+            credential.AttributeCount = 0
+            credential.Attributes = None
+            credential.TargetAlias = None
+            credential.UserName = APP_NAME
+            if not ctypes.windll.advapi32.CredWriteW(ctypes.byref(credential), 0):
+                raise ctypes.WinError()
+            return True
+        except Exception:
+            self._log_exception("Failed to store %s API key", provider)
+            return False
+
+    def _delete_secret(self, provider):
+        if os.name != "nt":
+            return False
+        try:
+            ctypes.windll.advapi32.CredDeleteW(self._credential_target_name(provider), 1, 0)
+            return True
+        except Exception:
+            self._log_exception("Failed to delete %s API key", provider)
+            return False
+
+    def _provider_ready(self, provider):
+        return bool(self._read_secret(provider))
+
+    def _available_ai_providers(self):
+        ordered = ["groq", "gemini", "anthropic", "openai"]
+        if ordered:
+            offset = self.ai_provider_cursor % len(ordered)
+            ordered = ordered[offset:] + ordered[:offset]
+        now = time.time()
+        ready = [provider for provider in ordered if self._provider_ready(provider) and self.ai_provider_backoff_until.get(provider, 0.0) <= now]
+        if ready:
+            return ready
+        return [provider for provider in ordered if self._provider_ready(provider)]
 
     def _resource_path(self, name):
         candidates = []
@@ -718,7 +925,7 @@ class LuauIDE:
         self._set_status(f"Luau runtime ready: {runtime_path.name}")
 
     def _build_titlebar(self):
-        bar = tk.Frame(self.root, bg=PANEL_BG, height=38)
+        bar = tk.Frame(self.top_chrome_frame, bg=PANEL_BG, height=34)
         self.titlebar_frame = bar
         bar.pack(fill=tk.X)
         bar.pack_propagate(False)
@@ -866,7 +1073,7 @@ class LuauIDE:
         return image
 
     def _build_toolbar(self):
-        toolbar = tk.Frame(self.root, bg=ACTIVITY_BG, height=48)
+        toolbar = tk.Frame(self.top_chrome_frame, bg=ACTIVITY_BG, height=40)
         self.toolbar_frame = toolbar
         toolbar.pack(fill=tk.X)
         toolbar.pack_propagate(False)
@@ -883,6 +1090,7 @@ class LuauIDE:
         self.toolbar_menu.add_command(label="Split Active Tab", command=self._split_active_tab)
         self.toolbar_menu.add_separator()
         self.toolbar_menu.add_command(label="Settings...", command=self._show_settings)
+        self.toolbar_menu.add_command(label="Toggle AI Completions", command=self._toggle_ai_completions)
         self.toolbar_menu.add_command(label="Set luau.exe Path...", command=self._choose_luau_path)
         self.toolbar_menu.add_command(label="Check For Updates", command=self._check_for_updates)
         self.toolbar_menu.add_command(label="Refresh Project", command=self._refresh_project)
@@ -906,22 +1114,22 @@ class LuauIDE:
             parent,
             bg=base_bg,
         )
-        btn.pack(side=tk.LEFT, padx=4, pady=4)
+        btn.pack(side=tk.LEFT, padx=3, pady=4)
         btn.configure(cursor="hand2")
-        icon = tk.Canvas(btn, width=18, height=18, bg=base_bg, highlightthickness=0, bd=0)
-        icon.pack(side=tk.LEFT, padx=(10, 6), pady=8)
+        icon = tk.Canvas(btn, width=16, height=16, bg=base_bg, highlightthickness=0, bd=0)
+        icon.pack(side=tk.LEFT, padx=(8, 5), pady=6)
         self._draw_toolbar_icon(icon, icon_name, "#e2e8f0")
         label = tk.Label(
             btn,
             text=text,
             bg=base_bg,
             fg=EDITOR_FG,
-            font=("Segoe UI Semibold", 10),
+            font=("Segoe UI Semibold", 9),
             padx=0,
-            pady=8,
+            pady=6,
             cursor="hand2",
         )
-        label.pack(side=tk.LEFT, padx=(0, 12))
+        label.pack(side=tk.LEFT, padx=(0, 8))
 
         def apply_bg(color):
             btn.config(bg=color)
@@ -1103,20 +1311,22 @@ class LuauIDE:
             return self._folder_icon_key(path)
         return self._file_icon_key(path)
 
-    def _mini_toolbar_button(self, parent, text, command, padding=(8, 4), font=("Segoe UI", 8)):
+    def _mini_toolbar_button(self, parent, text, command, padding=(8, 4), font=("Segoe UI", 8), bg=None, hover=None, fg=None):
+        base_bg = bg or BTN_BG
+        hover_bg = hover or BTN_HOVER
         button = tk.Label(
             parent,
             text=text,
-            bg=BTN_BG,
-            fg=EDITOR_FG,
+            bg=base_bg,
+            fg=fg or EDITOR_FG,
             font=font,
             padx=padding[0],
             pady=padding[1],
             cursor="hand2",
         )
         button.bind("<Button-1>", lambda _e: command())
-        button.bind("<Enter>", lambda _e: button.config(bg=BTN_HOVER))
-        button.bind("<Leave>", lambda _e: button.config(bg=BTN_BG))
+        button.bind("<Enter>", lambda _e: button.config(bg=hover_bg))
+        button.bind("<Leave>", lambda _e: button.config(bg=base_bg))
         return button
 
     def _build_editor(self, parent):
@@ -1130,7 +1340,19 @@ class LuauIDE:
         tk.Label(header, text="EDITOR", bg=PANEL_BG, fg="#9ccfd8", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=10, pady=6)
         self.breadcrumb_label = tk.Label(header, text="", bg=PANEL_BG, fg="#9fb3c8", font=("Segoe UI", 8))
         self.breadcrumb_label.pack(side=tk.LEFT, padx=10)
-        self._mini_toolbar_button(header, "Split", self._split_active_tab, padding=(8, 2)).pack(side=tk.RIGHT, padx=(0, 8), pady=4)
+        self.top_chrome_toggle_button = self._mini_toolbar_button(header, "Chrome v", self._toggle_top_chrome, padding=(8, 2))
+        self.top_chrome_toggle_button.pack(side=tk.RIGHT, padx=(0, 6), pady=4)
+        self.editor_run_button = self._mini_toolbar_button(
+            header,
+            "Run",
+            self._run,
+            padding=(8, 2),
+            font=("Segoe UI", 8, "bold"),
+            bg="#0e7490",
+            hover="#1389ab",
+            fg="#ecfeff",
+        )
+        self.editor_run_button.pack(side=tk.RIGHT, padx=(0, 6), pady=4)
         self.diagnostics_label = tk.Label(header, text="Diagnostics ready", bg=PANEL_BG, fg=LINE_FG, font=("Segoe UI", 8))
         self.diagnostics_label.pack(side=tk.RIGHT, padx=10)
 
@@ -1943,6 +2165,330 @@ class LuauIDE:
                 return found
         return None
 
+    def _lsp_command(self):
+        if not self.lsp_executable:
+            return []
+        name = Path(self.lsp_executable).name.lower()
+        if name.startswith("luau-lsp"):
+            return [self.lsp_executable, "lsp"]
+        return [self.lsp_executable]
+
+    def _lsp_language_id(self, tab):
+        if tab.path and tab.path.suffix.lower() == ".luau":
+            return "luau"
+        return "lua"
+
+    def _lsp_document_uri(self, tab):
+        if not tab.path:
+            return ""
+        try:
+            return tab.path.resolve().as_uri()
+        except ValueError:
+            return ""
+
+    def _lsp_supported_for_tab(self, tab):
+        if not self.lsp_executable or not tab or not tab.path:
+            return False
+        return tab.path.suffix.lower() in {".lua", ".luau"}
+
+    def _lsp_completion_active(self):
+        return bool(self.completion_popup and self.completion_tab and self.completion_listbox)
+
+    def _on_global_pointer_down(self, event):
+        if not self._lsp_completion_active():
+            return None
+        widget = event.widget
+        if widget == self.completion_listbox:
+            return None
+        self._hide_completion()
+        return None
+
+    def _read_lsp_message(self, stream):
+        headers = {}
+        while True:
+            line = stream.readline()
+            if not line:
+                return None
+            if line in {b"\r\n", b"\n"}:
+                break
+            decoded = line.decode("utf-8", errors="replace").strip()
+            if ":" not in decoded:
+                continue
+            key, value = decoded.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+        content_length = int(headers.get("content-length", "0") or "0")
+        if content_length <= 0:
+            return None
+        payload = stream.read(content_length)
+        if not payload:
+            return None
+        return json.loads(payload.decode("utf-8", errors="replace"))
+
+    def _write_lsp_message(self, payload):
+        if not self.lsp_process or not self.lsp_process.stdin:
+            raise RuntimeError("Language server is not running.")
+        body = json.dumps(payload).encode("utf-8")
+        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+        with self.lsp_write_lock:
+            self.lsp_process.stdin.write(header)
+            self.lsp_process.stdin.write(body)
+            self.lsp_process.stdin.flush()
+
+    def _lsp_server_request_result(self, method, params):
+        if method == "workspace/configuration":
+            items = params.get("items", []) if isinstance(params, dict) else []
+            results = []
+            for item in items:
+                section = ""
+                if isinstance(item, dict):
+                    section = str(item.get("section", "") or "")
+                if section in {"Lua", "luau-lsp"}:
+                    results.append({"completion": {"callSnippet": "Disable"}, "workspace": {"checkThirdParty": False}})
+                else:
+                    results.append({})
+            return results
+        return None
+
+    def _handle_lsp_message(self, message):
+        if "id" in message and "method" in message:
+            result = self._lsp_server_request_result(message.get("method", ""), message.get("params", {}))
+            try:
+                self._write_lsp_message({"jsonrpc": "2.0", "id": message["id"], "result": result})
+            except Exception:
+                self._log_exception("Failed to reply to language server request")
+            return
+        if "id" in message and ("result" in message or "error" in message):
+            pending = self.lsp_pending_requests.get(int(message["id"]))
+            if pending:
+                pending["message"] = message
+                pending["event"].set()
+            return
+        if message.get("method") == "window/logMessage":
+            params = message.get("params", {})
+            if isinstance(params, dict):
+                self._log_info("LSP: %s", params.get("message", ""))
+
+    def _lsp_reader_loop(self):
+        stream = self.lsp_process.stdout if self.lsp_process else None
+        if not stream:
+            return
+        try:
+            while True:
+                message = self._read_lsp_message(stream)
+                if message is None:
+                    break
+                self._handle_lsp_message(message)
+        except Exception:
+            self._log_exception("Language server reader failed")
+        finally:
+            with self.lsp_lock:
+                self.lsp_initialized = False
+                self.lsp_process = None
+            for pending in list(self.lsp_pending_requests.values()):
+                pending["message"] = {"error": {"message": "Language server disconnected."}}
+                pending["event"].set()
+
+    def _lsp_stderr_loop(self):
+        stream = self.lsp_process.stderr if self.lsp_process else None
+        if not stream:
+            return
+        try:
+            while True:
+                line = stream.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    self._log_info("LSP stderr: %s", text)
+        except Exception:
+            self._log_exception("Language server stderr reader failed")
+
+    def _send_lsp_notification(self, method, params):
+        self._write_lsp_message({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _send_lsp_request(self, method, params, timeout=4.0):
+        with self.lsp_lock:
+            self.lsp_request_id += 1
+            request_id = self.lsp_request_id
+        event = threading.Event()
+        self.lsp_pending_requests[request_id] = {"event": event, "message": None}
+        self._write_lsp_message({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        if not event.wait(timeout):
+            self.lsp_pending_requests.pop(request_id, None)
+            raise RuntimeError(f"Timed out waiting for {method}.")
+        payload = self.lsp_pending_requests.pop(request_id, None) or {"message": None}
+        response = payload.get("message") or {}
+        if "error" in response:
+            error = response.get("error") or {}
+            raise RuntimeError(str(error.get("message", f"{method} failed")))
+        return response.get("result")
+
+    def _ensure_lsp_client(self):
+        if not self.lsp_executable:
+            return False
+        with self.lsp_lock:
+            if self.lsp_process and self.lsp_process.poll() is None and self.lsp_initialized:
+                return True
+            if self.lsp_process and self.lsp_process.poll() is None and not self.lsp_initialized:
+                return False
+            command = self._lsp_command()
+            if not command:
+                return False
+            self.lsp_process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(self.project_root),
+            )
+            self.lsp_reader_thread = threading.Thread(target=self._lsp_reader_loop, daemon=True)
+            self.lsp_reader_thread.start()
+            self.lsp_stderr_thread = threading.Thread(target=self._lsp_stderr_loop, daemon=True)
+            self.lsp_stderr_thread.start()
+        result = self._send_lsp_request(
+            "initialize",
+            {
+                "processId": os.getpid(),
+                "clientInfo": {"name": APP_NAME, "version": APP_VERSION},
+                "rootUri": self.project_root.resolve().as_uri(),
+                "workspaceFolders": [{"uri": self.project_root.resolve().as_uri(), "name": self.project_root.name}],
+                "capabilities": {
+                    "textDocument": {
+                        "completion": {
+                            "completionItem": {
+                                "snippetSupport": False,
+                                "documentationFormat": ["markdown", "plaintext"],
+                            }
+                        }
+                    }
+                },
+                "initializationOptions": {},
+            },
+            timeout=5.0,
+        )
+        self._send_lsp_notification("initialized", {})
+        self.lsp_initialized = True
+        if Path(self.lsp_executable).name.lower().startswith("lua-language-server"):
+            self._send_lsp_notification(
+                "workspace/didChangeConfiguration",
+                {"settings": {"Lua": {"completion": {"callSnippet": "Disable"}, "workspace": {"checkThirdParty": False}}}},
+            )
+        return bool(result is not None or self.lsp_initialized)
+
+    def _sync_lsp_document(self, snapshot):
+        uri = snapshot["uri"]
+        text = snapshot["text"]
+        version = self.lsp_document_versions.get(uri, 0)
+        if uri not in self.lsp_document_text:
+            version = 1
+            self._send_lsp_notification(
+                "textDocument/didOpen",
+                {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": snapshot["language_id"],
+                        "version": version,
+                        "text": text,
+                    }
+                },
+            )
+            self.lsp_document_versions[uri] = version
+            self.lsp_document_text[uri] = text
+            return
+        if self.lsp_document_text.get(uri) == text:
+            return
+        version += 1
+        self._send_lsp_notification(
+            "textDocument/didChange",
+            {
+                "textDocument": {"uri": uri, "version": version},
+                "contentChanges": [{"text": text}],
+            },
+        )
+        self.lsp_document_versions[uri] = version
+        self.lsp_document_text[uri] = text
+
+    def _completion_signature(self, tab):
+        context = self._completion_context(tab)
+        before = tab.text.get("1.0", "insert")
+        after = tab.text.get("insert", "insert lineend")
+        path = str(tab.path) if tab.path else tab.untitled_name
+        return "\0".join((path, context["kind"], context["base"], context["prefix"], before[-320:], after[:120]))
+
+    def _build_lsp_completion_snapshot(self, tab):
+        if not self._lsp_supported_for_tab(tab):
+            return None
+        insert_index = tab.text.index("insert")
+        line_no, column = insert_index.split(".")
+        return {
+            "tab_id": str(tab.frame),
+            "insert_index": insert_index,
+            "uri": self._lsp_document_uri(tab),
+            "language_id": self._lsp_language_id(tab),
+            "text": tab.text.get("1.0", "end-1c"),
+            "line": max(int(line_no) - 1, 0),
+            "character": int(column),
+            "signature": self._completion_signature(tab),
+        }
+
+    def _strip_snippet_placeholders(self, text):
+        text = re.sub(r"\$\{[0-9]+:([^}]*)\}", r"\1", text)
+        text = re.sub(r"\$\{[0-9]+\}", "", text)
+        text = re.sub(r"\$[0-9]+", "", text)
+        return text
+
+    def _normalize_lsp_completion_entry(self, item):
+        label = str(item.get("label", "") or "").strip()
+        if not label:
+            return None
+        text_edit = item.get("textEdit") or {}
+        new_text = str(text_edit.get("newText", "") or "")
+        insert_text = str(item.get("insertText", "") or "")
+        chosen = new_text or insert_text or label
+        if int(item.get("insertTextFormat", 1) or 1) == 2:
+            chosen = self._strip_snippet_placeholders(chosen)
+        chosen = chosen.strip()
+        if not chosen:
+            chosen = label
+        return {"label": label, "insert_text": chosen}
+
+    def _request_lsp_completion_entries(self, snapshot):
+        if not self._ensure_lsp_client():
+            return []
+        self._sync_lsp_document(snapshot)
+        result = self._send_lsp_request(
+            "textDocument/completion",
+            {
+                "textDocument": {"uri": snapshot["uri"]},
+                "position": {"line": snapshot["line"], "character": snapshot["character"]},
+                "context": {"triggerKind": 1},
+            },
+            timeout=3.0,
+        )
+        items = result.get("items", []) if isinstance(result, dict) else result or []
+        entries = []
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            entry = self._normalize_lsp_completion_entry(item)
+            if not entry:
+                continue
+            key = (entry["label"].lower(), entry["insert_text"])
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(entry)
+        return entries[:80]
+
+    def _cancel_lsp_completion_job(self, tab):
+        job = self.lsp_completion_jobs.pop(str(tab.frame), None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+
     def _load_state(self):
         legacy_path = Path(__file__).with_name("luau_ide_state.json")
         path = self.state_path if self.state_path.exists() else legacy_path
@@ -1970,6 +2516,15 @@ class LuauIDE:
         self.autosave_delay_ms = int(state.get("autosave_delay_ms", 1500))
         self.tab_width_spaces = int(state.get("tab_width_spaces", DEFAULT_TAB_WIDTH))
         self.current_theme_name = state.get("theme_name", "Midnight")
+        self.top_chrome_visible = bool(state.get("top_chrome_visible", True))
+        self.ai_completion_enabled = bool(state.get("ai_completion_enabled", False))
+        self.ai_completion_debounce_ms = int(state.get("ai_completion_debounce_ms", DEFAULT_AI_DEBOUNCE_MS))
+        self.groq_model_name = state.get("groq_model_name", DEFAULT_GROQ_MODEL).strip() or DEFAULT_GROQ_MODEL
+        if self.groq_model_name == "qwen/qwen3-32b":
+            self.groq_model_name = DEFAULT_GROQ_MODEL
+        self.gemini_model_name = state.get("gemini_model_name", DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
+        self.anthropic_model_name = state.get("anthropic_model_name", DEFAULT_ANTHROPIC_MODEL).strip() or DEFAULT_ANTHROPIC_MODEL
+        self.openai_model_name = state.get("openai_model_name", DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
 
         root_path = Path(state.get("project_root", self.project_root)).resolve()
         if not root_path.exists():
@@ -2034,6 +2589,7 @@ class LuauIDE:
         self.root.after(180, self._start_all_terminal_sessions)
         self.root.after(200, self._apply_tab_width)
         self.root.after(220, lambda: self._apply_theme_preset(self.current_theme_name))
+        self.root.after(240, lambda visible=self.top_chrome_visible: self._set_top_chrome_visible(visible))
 
     def _apply_startup_editor_focus_layout(self):
         if self.sidebar_visible:
@@ -2135,6 +2691,13 @@ class LuauIDE:
             "autosave_delay_ms": self.autosave_delay_ms,
             "tab_width_spaces": self.tab_width_spaces,
             "theme_name": self.current_theme_name,
+            "top_chrome_visible": self.top_chrome_visible,
+            "ai_completion_enabled": self.ai_completion_enabled,
+            "ai_completion_debounce_ms": self.ai_completion_debounce_ms,
+            "groq_model_name": self.groq_model_name,
+            "gemini_model_name": self.gemini_model_name,
+            "anthropic_model_name": self.anthropic_model_name,
+            "openai_model_name": self.openai_model_name,
             "sidebar_visible": self.sidebar_visible,
             "panels_visible": self.panels_visible,
             "outline_visible": self.outline_visible,
@@ -2832,18 +3395,21 @@ class LuauIDE:
         text.tag_configure("search", background="#3d2f12")
         text.tag_configure("multi_cursor", background=MULTI_CURSOR_BG, foreground=MULTI_CURSOR_FG)
         text.tag_configure("bracket_match", background="#3b82f6", foreground="#ffffff")
+        text.tag_configure("ai_hint_inline", foreground="#64748b")
 
         text.bind("<KeyPress>", lambda event, current=tab: self._on_editor_keypress(current, event))
         text.bind("<KeyRelease>", lambda _e, current=tab: self._on_editor_keyrelease(current))
-        text.bind("<ButtonRelease-1>", lambda _e, current=tab: self._on_editor_cursor_change(current))
-        text.bind("<Button-1>", lambda _e, current=tab: self._clear_multi_cursors(current))
+        text.bind("<ButtonPress-1>", lambda _e, current=tab: self._on_editor_left_click(current), add="+")
+        text.bind("<ButtonRelease-1>", lambda _e, current=tab: self._on_editor_cursor_change(current), add="+")
         text.bind("<FocusOut>", lambda _e, current=tab: self._on_editor_focus_out(current))
         text.bind("<MouseWheel>", lambda _e, current=tab: self.root.after_idle(lambda: self._update_line_numbers(current)))
         text.bind("<Return>", lambda event, current=tab: self._auto_indent(current, event))
         text.bind("<BackSpace>", lambda event, current=tab: self._on_editor_backspace(current, event))
         text.bind("<<Modified>>", lambda _e, current=tab: self._on_modified(current))
         text.bind("<Control-space>", lambda _e, current=tab: self._show_completion(current))
-        text.bind("<Escape>", lambda _e: self._hide_completion())
+        text.bind("<Escape>", lambda _e, current=tab: self._dismiss_editor_assists(current))
+        text.bind("<Up>", lambda _e, current=tab: self._on_completion_up(current))
+        text.bind("<Down>", lambda _e, current=tab: self._on_completion_down(current))
         text.bind("<Tab>", lambda event, current=tab: self._on_editor_tab_key(current, event))
         text.bind("<Shift-Tab>", lambda event, current=tab: self._outdent_selection_or_line(current, event))
         text.bind("<Control-c>", lambda event, current=tab: self._on_editor_copy(current, event))
@@ -2946,6 +3512,7 @@ class LuauIDE:
             self.root.after_cancel(tab.highlight_job)
         if tab.diagnostics_job:
             self.root.after_cancel(tab.diagnostics_job)
+        self._cancel_lsp_completion_job(tab)
         if self.completion_tab == tab:
             self._hide_completion()
         notebook = self.tab_notebooks.pop(str(tab.frame), self.editor_notebook)
@@ -3143,6 +3710,7 @@ class LuauIDE:
         tab.lines.yview_moveto(first)
 
     def _on_editor_keyrelease(self, tab):
+        self._maybe_realign_dedent_keyword(tab)
         if tab == self._active_tab():
             self._update_cursor(tab)
         self._refresh_multi_cursor_tags(tab)
@@ -3152,12 +3720,19 @@ class LuauIDE:
         self._schedule_diagnostics(tab)
         if self.completion_popup and tab == self.completion_tab:
             self._update_completion_items(tab)
+            self._schedule_lsp_completion(tab)
+        else:
+            self._maybe_show_local_completion(tab)
+        self._schedule_ai_completion(tab)
 
     def _on_editor_cursor_change(self, tab):
         if tab == self._active_tab():
             self._update_cursor(tab)
         self._refresh_multi_cursor_tags(tab)
         self._refresh_bracket_match(tab)
+        if self.completion_tab == tab:
+            self._hide_completion()
+        self._hide_ai_hint(tab)
 
     def _on_modified(self, tab):
         if not tab.loaded:
@@ -3213,6 +3788,13 @@ class LuauIDE:
             start = f"1.0+{func_match.start(1)}c"
             end = f"1.0+{func_match.end(1)}c"
             tab.text.tag_add("function_name", start, end)
+        for protected_tag in ("comment", "string"):
+            ranges = list(tab.text.tag_ranges(protected_tag))
+            for index in range(0, len(ranges), 2):
+                start = ranges[index]
+                end = ranges[index + 1]
+                for tag in ("keyword", "builtin", "number", "function_name"):
+                    tab.text.tag_remove(tag, start, end)
 
     def _update_diagnostics(self, tab):
         tab.diagnostics_job = None
@@ -3346,6 +3928,11 @@ class LuauIDE:
         if tab.multi_cursors:
             tab.multi_cursors.clear()
             self._refresh_multi_cursor_tags(tab)
+        return None
+
+    def _on_editor_left_click(self, tab):
+        self._hide_completion()
+        self._clear_multi_cursors(tab)
         return None
 
     def _cursor_positions(self, tab):
@@ -3669,6 +4256,9 @@ class LuauIDE:
         char = event.char
         if not char or char in {"\r", "\t", "\x08"}:
             return None
+        self._hide_ai_hint(tab)
+        if self.completion_popup and self.completion_tab == tab and (char in AUTO_PAIRS or char in CLOSING_CHARS):
+            self._hide_completion()
         if char in AUTO_PAIRS:
             closer = AUTO_PAIRS[char]
             if self._wrap_selection(tab, char, closer):
@@ -3701,6 +4291,7 @@ class LuauIDE:
         return None
 
     def _on_editor_backspace(self, tab, _event=None):
+        self._hide_ai_hint(tab)
         selection = self._selection_range(tab.text)
         if selection:
             tab.text.delete(selection[0], selection[1])
@@ -3753,6 +4344,7 @@ class LuauIDE:
     def _on_editor_tab_changed(self, _event=None):
         if _event and hasattr(_event, "widget"):
             self._set_active_notebook(_event.widget)
+        self._hide_ai_hint()
         tab = self._active_tab()
         if not tab:
             self._render_all_editor_tab_bars()
@@ -3770,22 +4362,65 @@ class LuauIDE:
         )
         self._refresh_outline(tab)
 
+    def _line_starts_dedent_keyword(self, stripped):
+        return bool(re.match(r"^(else|elseif\b|end\b|until\b)", stripped))
+
+    def _line_opens_block(self, stripped):
+        return (
+            stripped == "else"
+            or stripped.endswith(("then", "do", "repeat"))
+            or stripped.endswith(("(", "{", "["))
+            or bool(re.search(r"\bfunction\b", stripped))
+        )
+
+    def _normalize_current_line_indent(self, tab, pos):
+        line_start = tab.text.index(f"{pos} linestart")
+        line_end = tab.text.index(f"{line_start} lineend")
+        column = int(pos.split(".")[1])
+        line = tab.text.get(line_start, line_end)
+        stripped = line.strip()
+        indent = self._line_leading_spaces(line)
+        if self._line_starts_dedent_keyword(stripped) and indent >= 4:
+            updated = (" " * (indent - 4)) + line.lstrip(" ")
+            tab.text.delete(line_start, line_end)
+            tab.text.insert(line_start, updated)
+            line = updated
+            stripped = line.strip()
+            indent -= 4
+            pos = tab.text.index(f"{line_start}+{max(column - 4, 0)}c")
+        return pos, line, stripped, indent
+
+    def _maybe_realign_dedent_keyword(self, tab):
+        if tab.multi_cursors or self._selection_range(tab.text):
+            return
+        insert_index = tab.text.index(tk.INSERT)
+        line_start = tab.text.index(f"{insert_index} linestart")
+        line = tab.text.get(line_start, f"{line_start} lineend")
+        stripped = line.strip()
+        if not self._line_starts_dedent_keyword(stripped):
+            return
+        updated_index, _line, _stripped, _indent = self._normalize_current_line_indent(tab, insert_index)
+        if updated_index != insert_index:
+            tab.text.mark_set(tk.INSERT, updated_index)
+
     def _auto_indent(self, tab, _event):
+        if self.completion_popup and tab == self.completion_tab:
+            return self._apply_completion()
         positions = self._cursor_positions(tab)
+        allow_line_realign = len(positions) == 1
         inserts = []
         new_primary = None
         move_between = False
         for pos in positions:
             line_no = int(pos.split(".")[0])
-            line = tab.text.get(f"{pos} linestart", pos)
-            stripped = line.strip()
-            indent = self._line_leading_spaces(line)
+            if allow_line_realign:
+                pos, line, stripped, indent = self._normalize_current_line_indent(tab, pos)
+            else:
+                line = tab.text.get(f"{pos} linestart", pos)
+                stripped = line.strip()
+                indent = self._line_leading_spaces(line)
             next_char = tab.text.get(pos, f"{pos}+1c")
-            increase = (
-                stripped.endswith(("then", "do", "repeat"))
-                or stripped.endswith(("(", "{", "["))
-                or bool(re.search(r"\bfunction\b", stripped))
-            )
+            increase = self._line_opens_block(stripped)
             inner_indent = indent + 4 if increase else indent
             if next_char in ")]}":
                 inserts.append("\n" + (" " * inner_indent) + "\n" + (" " * indent))
@@ -3807,7 +4442,15 @@ class LuauIDE:
 
     def _set_status(self, text):
         self.status_label.config(text=text)
-        self._log_info("%s", text)
+
+    def _toggle_ai_completions(self):
+        self.ai_completion_enabled = not self.ai_completion_enabled
+        if not self.ai_completion_enabled:
+            self._hide_ai_hint()
+            for tab in list(self.tabs.values()):
+                self._cancel_ai_completion_job(tab)
+        self._save_state()
+        self._set_status("AI completions enabled" if self.ai_completion_enabled else "AI completions disabled")
 
     def _theme_presets(self):
         return {
@@ -3820,6 +4463,7 @@ class LuauIDE:
         self.current_theme_name = theme_name or self.current_theme_name
         palette = self._theme_presets().get(self.current_theme_name, self._theme_presets()["Midnight"])
         try:
+            self.top_chrome_frame.config(bg=palette["title_bg"])
             self.titlebar_frame.config(bg=palette["title_bg"])
             self.toolbar_frame.config(bg=palette["toolbar_bg"])
             self.statusbar_frame.config(bg=palette["status_bg"])
@@ -3859,6 +4503,8 @@ class LuauIDE:
             self._write_recovery_snapshot(tab)
 
     def _on_editor_focus_out(self, tab):
+        if self.completion_tab == tab:
+            self._hide_completion()
         if self.autosave_mode == "focus" and tab.path and tab.modified:
             self._autosave_tab(tab)
         elif tab.modified:
@@ -3898,7 +4544,9 @@ class LuauIDE:
         window.title("Lume Settings")
         window.transient(self.root)
         window.configure(bg=PANEL_BG)
-        window.geometry("540x420")
+        settings_height = min(560, max(500, self.root.winfo_screenheight() - 180))
+        window.geometry(f"600x{settings_height}")
+        window.minsize(560, 420)
         self.settings_window = window
         window.protocol("WM_DELETE_WINDOW", lambda: (setattr(self, "settings_window", None), window.destroy()))
 
@@ -3910,9 +4558,71 @@ class LuauIDE:
         autosave_delay_var = tk.IntVar(value=max(500, self.autosave_delay_ms))
         luau_var = tk.StringVar(value=self.luau_path_var.get())
         theme_var = tk.StringVar(value=self.current_theme_name)
+        ai_enabled_var = tk.BooleanVar(value=self.ai_completion_enabled)
+        ai_debounce_var = tk.IntVar(value=max(120, self.ai_completion_debounce_ms))
+        groq_model_var = tk.StringVar(value=self.groq_model_name)
+        gemini_model_var = tk.StringVar(value=self.gemini_model_name)
+        anthropic_model_var = tk.StringVar(value=self.anthropic_model_name)
+        openai_model_var = tk.StringVar(value=self.openai_model_name)
+        groq_key_var = tk.StringVar(value=self._read_secret("groq"))
+        gemini_key_var = tk.StringVar(value=self._read_secret("gemini"))
+        anthropic_key_var = tk.StringVar(value=self._read_secret("anthropic"))
+        openai_key_var = tk.StringVar(value=self._read_secret("openai"))
 
-        fields = tk.Frame(window, bg=PANEL_BG)
-        fields.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+        content_shell = tk.Frame(window, bg=PANEL_BG)
+        content_shell.pack(fill=tk.BOTH, expand=True, padx=16, pady=(16, 8))
+        content_canvas = tk.Canvas(content_shell, bg=PANEL_BG, highlightthickness=0, bd=0)
+        content_scroll = ttk.Scrollbar(content_shell, style="Modern.Vertical.TScrollbar", command=content_canvas.yview)
+        content_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        content_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        content_canvas.configure(yscrollcommand=content_scroll.set)
+
+        fields = tk.Frame(content_canvas, bg=PANEL_BG)
+        fields_window = content_canvas.create_window((0, 0), window=fields, anchor="nw")
+
+        def sync_settings_scrollregion(_event=None):
+            try:
+                content_canvas.configure(scrollregion=content_canvas.bbox("all"))
+            except tk.TclError:
+                pass
+
+        def fit_settings_content(_event=None):
+            try:
+                content_canvas.itemconfigure(fields_window, width=content_canvas.winfo_width())
+                content_canvas.configure(scrollregion=content_canvas.bbox("all"))
+            except tk.TclError:
+                pass
+
+        def on_settings_mousewheel(event):
+            try:
+                delta = event.delta
+                if delta:
+                    content_canvas.yview_scroll(int(-delta / 120), "units")
+                elif getattr(event, "num", None) == 4:
+                    content_canvas.yview_scroll(-3, "units")
+                elif getattr(event, "num", None) == 5:
+                    content_canvas.yview_scroll(3, "units")
+            except tk.TclError:
+                pass
+            return "break"
+
+        fields.bind("<Configure>", sync_settings_scrollregion)
+        content_canvas.bind("<Configure>", fit_settings_content)
+        content_canvas.bind_all("<MouseWheel>", on_settings_mousewheel, add="+")
+        content_canvas.bind_all("<Button-4>", on_settings_mousewheel, add="+")
+        content_canvas.bind_all("<Button-5>", on_settings_mousewheel, add="+")
+
+        def close_settings_window():
+            try:
+                content_canvas.unbind_all("<MouseWheel>")
+                content_canvas.unbind_all("<Button-4>")
+                content_canvas.unbind_all("<Button-5>")
+            except tk.TclError:
+                pass
+            self.settings_window = None
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", close_settings_window)
 
         def row(label_text, widget, row_no):
             tk.Label(fields, text=label_text, bg=PANEL_BG, fg=EDITOR_FG, anchor="w", font=("Segoe UI", 9)).grid(row=row_no, column=0, sticky="w", pady=8, padx=(0, 12))
@@ -3929,6 +4639,66 @@ class LuauIDE:
         luau_entry = tk.Entry(fields, textvariable=luau_var, bg="#111827", fg=EDITOR_FG, insertbackground=EDITOR_FG, relief=tk.FLAT)
         row("Luau path", luau_entry, 7)
 
+        section = tk.Label(fields, text="AI code completion", bg=PANEL_BG, fg="#9ccfd8", anchor="w", font=("Segoe UI", 9, "bold"))
+        section.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(18, 8))
+
+        ai_toggle = tk.Checkbutton(
+            fields,
+            text="Enable AI code completions",
+            variable=ai_enabled_var,
+            bg=PANEL_BG,
+            fg=EDITOR_FG,
+            activebackground=PANEL_BG,
+            activeforeground=EDITOR_FG,
+            selectcolor="#111827",
+            font=("Segoe UI", 9),
+        )
+        ai_toggle.grid(row=9, column=1, sticky="w", pady=8)
+        tk.Label(fields, text="AI completions", bg=PANEL_BG, fg=EDITOR_FG, anchor="w", font=("Segoe UI", 9)).grid(row=9, column=0, sticky="w", pady=8, padx=(0, 12))
+        row("AI debounce (ms)", tk.Spinbox(fields, from_=120, to=1200, increment=20, textvariable=ai_debounce_var, bg="#111827", fg=EDITOR_FG, relief=tk.FLAT), 10)
+        row("Groq model", tk.Entry(fields, textvariable=groq_model_var, bg="#111827", fg=EDITOR_FG, insertbackground=EDITOR_FG, relief=tk.FLAT), 11)
+
+        groq_key_row = tk.Frame(fields, bg=PANEL_BG)
+        groq_key_entry = tk.Entry(groq_key_row, textvariable=groq_key_var, show="*", bg="#111827", fg=EDITOR_FG, insertbackground=EDITOR_FG, relief=tk.FLAT)
+        groq_key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._mini_toolbar_button(groq_key_row, "Clear", lambda: groq_key_var.set("")).pack(side=tk.LEFT, padx=(8, 0))
+        row("Groq API key", groq_key_row, 12)
+
+        row("Gemini model", tk.Entry(fields, textvariable=gemini_model_var, bg="#111827", fg=EDITOR_FG, insertbackground=EDITOR_FG, relief=tk.FLAT), 13)
+
+        gemini_key_row = tk.Frame(fields, bg=PANEL_BG)
+        gemini_key_entry = tk.Entry(gemini_key_row, textvariable=gemini_key_var, show="*", bg="#111827", fg=EDITOR_FG, insertbackground=EDITOR_FG, relief=tk.FLAT)
+        gemini_key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._mini_toolbar_button(gemini_key_row, "Clear", lambda: gemini_key_var.set("")).pack(side=tk.LEFT, padx=(8, 0))
+        row("Gemini API key", gemini_key_row, 14)
+
+        row("Claude model", tk.Entry(fields, textvariable=anthropic_model_var, bg="#111827", fg=EDITOR_FG, insertbackground=EDITOR_FG, relief=tk.FLAT), 15)
+
+        anthropic_key_row = tk.Frame(fields, bg=PANEL_BG)
+        anthropic_key_entry = tk.Entry(anthropic_key_row, textvariable=anthropic_key_var, show="*", bg="#111827", fg=EDITOR_FG, insertbackground=EDITOR_FG, relief=tk.FLAT)
+        anthropic_key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._mini_toolbar_button(anthropic_key_row, "Clear", lambda: anthropic_key_var.set("")).pack(side=tk.LEFT, padx=(8, 0))
+        row("Claude API key", anthropic_key_row, 16)
+
+        row("GPT model", tk.Entry(fields, textvariable=openai_model_var, bg="#111827", fg=EDITOR_FG, insertbackground=EDITOR_FG, relief=tk.FLAT), 17)
+
+        openai_key_row = tk.Frame(fields, bg=PANEL_BG)
+        openai_key_entry = tk.Entry(openai_key_row, textvariable=openai_key_var, show="*", bg="#111827", fg=EDITOR_FG, insertbackground=EDITOR_FG, relief=tk.FLAT)
+        openai_key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._mini_toolbar_button(openai_key_row, "Clear", lambda: openai_key_var.set("")).pack(side=tk.LEFT, padx=(8, 0))
+        row("GPT API key", openai_key_row, 18)
+
+        tk.Label(
+            fields,
+            text="Keys are stored in Windows Credential Manager and are not written into luau_ide_state.json.",
+            bg=PANEL_BG,
+            fg=LINE_FG,
+            justify=tk.LEFT,
+            wraplength=420,
+            anchor="w",
+            font=("Segoe UI", 8),
+        ).grid(row=19, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
         button_row = tk.Frame(window, bg=PANEL_BG)
         button_row.pack(fill=tk.X, padx=16, pady=(0, 16))
 
@@ -3938,23 +4708,41 @@ class LuauIDE:
                 luau_var.set(selected)
 
         def apply_settings():
-            self.shell_var.set(shell_var.get())
-            self.code_font.configure(size=int(code_size_var.get()))
-            self.term_font.configure(size=int(term_size_var.get()))
-            self.line_font.configure(size=max(int(code_size_var.get()) - 1, 8))
-            self.tab_width_spaces = int(tab_width_var.get())
-            self.autosave_mode = autosave_var.get()
-            self.autosave_delay_ms = int(autosave_delay_var.get())
-            self.luau_path_var.set(luau_var.get().strip())
-            self.current_theme_name = theme_var.get()
-            self._apply_tab_width()
-            self._apply_theme_preset(self.current_theme_name)
-            self._save_state()
-            self._set_status("Settings applied")
+            try:
+                self.shell_var.set(shell_var.get())
+                self.code_font.configure(size=int(code_size_var.get()))
+                self.term_font.configure(size=int(term_size_var.get()))
+                self.line_font.configure(size=max(int(code_size_var.get()) - 1, 8))
+                self.tab_width_spaces = int(tab_width_var.get())
+                self.autosave_mode = autosave_var.get()
+                self.autosave_delay_ms = int(autosave_delay_var.get())
+                self.luau_path_var.set(luau_var.get().strip())
+                self.current_theme_name = theme_var.get()
+                self.ai_completion_enabled = bool(ai_enabled_var.get())
+                self.ai_completion_debounce_ms = int(ai_debounce_var.get())
+                self.groq_model_name = groq_model_var.get().strip() or DEFAULT_GROQ_MODEL
+                self.gemini_model_name = gemini_model_var.get().strip() or DEFAULT_GEMINI_MODEL
+                self.anthropic_model_name = anthropic_model_var.get().strip() or DEFAULT_ANTHROPIC_MODEL
+                self.openai_model_name = openai_model_var.get().strip() or DEFAULT_OPENAI_MODEL
+                self._write_secret("groq", groq_key_var.get()) if groq_key_var.get().strip() else self._delete_secret("groq")
+                self._write_secret("gemini", gemini_key_var.get()) if gemini_key_var.get().strip() else self._delete_secret("gemini")
+                self._write_secret("anthropic", anthropic_key_var.get()) if anthropic_key_var.get().strip() else self._delete_secret("anthropic")
+                self._write_secret("openai", openai_key_var.get()) if openai_key_var.get().strip() else self._delete_secret("openai")
+                if not self.ai_completion_enabled:
+                    self._hide_ai_hint()
+                    for tab in list(self.tabs.values()):
+                        self._cancel_ai_completion_job(tab)
+                self._apply_tab_width()
+                self._apply_theme_preset(self.current_theme_name)
+                self._save_state()
+                self._set_status("Settings applied")
+            except Exception as exc:
+                self._log_exception("Failed to apply settings")
+                messagebox.showerror("Settings", f"Could not save settings:\n{exc}", parent=window)
 
         self._mini_toolbar_button(button_row, "Browse luau.exe", browse_luau).pack(side=tk.LEFT, padx=4)
-        self._mini_toolbar_button(button_row, "Apply", apply_settings).pack(side=tk.RIGHT, padx=4)
-        self._mini_toolbar_button(button_row, "Close", lambda: (setattr(self, "settings_window", None), window.destroy())).pack(side=tk.RIGHT, padx=4)
+        self._mini_toolbar_button(button_row, "Save", apply_settings).pack(side=tk.RIGHT, padx=4)
+        self._mini_toolbar_button(button_row, "Close", close_settings_window).pack(side=tk.RIGHT, padx=4)
 
     def _check_for_updates(self):
         messagebox.showinfo(
@@ -4226,6 +5014,7 @@ class LuauIDE:
             ("Save", self._save_active_tab),
             ("Save As", self._save_active_tab_as),
             ("Settings", self._show_settings),
+            ("Toggle AI Completions", self._toggle_ai_completions),
             ("Check For Updates", self._check_for_updates),
             ("Quick Open", self._show_quick_open),
             ("Recent Files", self._show_recent_files),
@@ -4312,24 +5101,162 @@ class LuauIDE:
         match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)$", before)
         return match.group(1) if match else ""
 
-    def _completion_candidates(self, tab):
-        words = set(KEYWORDS) | set(BUILTINS)
-        content_words = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", tab.text.get("1.0", "end-1c"))
-        words.update(content_words)
-        prefix = self._word_prefix(tab)
-        candidates = sorted(word for word in words if word != prefix and word.startswith(prefix))
-        return prefix, candidates
+    def _completion_context(self, tab):
+        before_line = tab.text.get("insert linestart", "insert")
+        member_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*([.:])\s*([A-Za-z_][A-Za-z0-9_]*)?$", before_line)
+        if member_match:
+            return {
+                "kind": "member",
+                "base": member_match.group(1),
+                "operator": member_match.group(2),
+                "prefix": member_match.group(3) or "",
+            }
+        return {
+            "kind": "identifier",
+            "base": "",
+            "operator": "",
+            "prefix": self._word_prefix(tab),
+        }
 
-    def _show_completion(self, tab):
+    def _all_editor_text(self):
+        parts = []
+        for current in self.tabs.values():
+            try:
+                parts.append(current.text.get("1.0", "end-1c"))
+            except tk.TclError:
+                continue
+        return "\n".join(parts)
+
+    def _collect_scored_identifiers(self, before_context, current_content, prefix):
+        scores = defaultdict(float)
+        lowered_prefix = prefix.lower()
+
+        def add(word, score):
+            if not word or word == prefix:
+                return
+            if lowered_prefix and not word.lower().startswith(lowered_prefix):
+                return
+            scores[word] = max(scores[word], score)
+
+        local_patterns = [
+            r"\blocal\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+            r"\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+            r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+            r"\bfor\s+[A-Za-z_][A-Za-z0-9_]*\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\b",
+        ]
+        for pattern in local_patterns:
+            for match in re.finditer(pattern, before_context):
+                add(match.group(1), 240.0)
+
+        for params in re.finditer(r"\bfunction\b[^(]*\(([^)]*)\)", before_context):
+            for param in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", params.group(1)):
+                add(param, 250.0)
+
+        recent_tokens = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", before_context)
+        for index, token in enumerate(reversed(recent_tokens[-220:])):
+            add(token, 220.0 - min(index, 160) * 0.8)
+
+        token_counts = Counter(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", current_content))
+        for token, count in token_counts.items():
+            add(token, 80.0 + min(count, 12) * 3.0)
+
+        for token in BUILTINS:
+            add(token, 55.0)
+        for token in KEYWORDS:
+            add(token, 45.0)
+
+        return scores
+
+    def _collect_scored_members(self, all_text, base_name, prefix):
+        scores = defaultdict(float)
+        lowered_prefix = prefix.lower()
+
+        def add(member, score):
+            if not member:
+                return
+            if lowered_prefix and not member.lower().startswith(lowered_prefix):
+                return
+            scores[member] = max(scores[member], score)
+
+        base_pattern = re.escape(base_name)
+        specific_patterns = [
+            rf"\b{base_pattern}\s*[.:]\s*([A-Za-z_][A-Za-z0-9_]*)",
+            rf"\bfunction\s+{base_pattern}\s*[:.]\s*([A-Za-z_][A-Za-z0-9_]*)",
+            rf"\b{base_pattern}\s*\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\]",
+        ]
+        for pattern in specific_patterns:
+            for match in re.finditer(pattern, all_text):
+                add(match.group(1), 260.0)
+
+        if base_name == "self":
+            for match in re.finditer(r"\bfunction\s+self\s*[:.]\s*([A-Za-z_][A-Za-z0-9_]*)", all_text):
+                add(match.group(1), 280.0)
+
+        all_members = Counter(match.group(2) for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*[:.]\s*([A-Za-z_][A-Za-z0-9_]*)", all_text))
+        for member, count in all_members.items():
+            add(member, 40.0 + min(count, 10) * 4.0)
+
+        return scores
+
+    def _completion_candidates(self, tab):
+        context = self._completion_context(tab)
+        prefix = context["prefix"]
+        current_content = tab.text.get("1.0", "end-1c")
+        before_context = tab.text.get("1.0", "insert")
+        if context["kind"] == "member":
+            scores = self._collect_scored_members(self._all_editor_text(), context["base"], prefix)
+        else:
+            scores = self._collect_scored_identifiers(before_context, current_content, prefix)
+        ranked = sorted(scores.items(), key=lambda item: (-item[1], len(item[0]), item[0].lower()))
+        local_entries = [{"label": candidate, "insert_text": candidate} for candidate, _score in ranked[:120]]
+        lsp_entries = self.lsp_completion_cache.get(self._completion_signature(tab), [])
+        merged = []
+        seen = set()
+        for entry in list(lsp_entries) + local_entries:
+            key = (entry["label"].lower(), entry["insert_text"])
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(entry)
+        return prefix, merged
+
+    def _current_identifier_context(self, tab):
+        prefix = self._completion_context(tab)["prefix"]
+        before = tab.text.get("insert-1c", "insert") if tab.text.compare("insert", ">", "1.0") else ""
+        return prefix, before
+
+    def _local_completion_should_popup(self, tab):
+        context = self._completion_context(tab)
+        prefix, previous_char = self._current_identifier_context(tab)
+        if context["kind"] == "member":
+            return previous_char in {".", ":"} or len(prefix) >= 1
+        return len(prefix) >= 2 and (prefix[-1].isalnum() or prefix[-1] == "_") and previous_char not in {"", " ", "\n", "\t"}
+
+    def _maybe_show_local_completion(self, tab):
+        if self.completion_popup or self.ai_hint_tab == tab:
+            return
+        if not self._local_completion_should_popup(tab):
+            return
+        prefix, items = self._completion_candidates(tab)
+        context = self._completion_context(tab)
+        self._schedule_lsp_completion(tab)
+        if items and (prefix or context["kind"] == "member"):
+            self._show_completion(tab, silent=True)
+
+    def _show_completion(self, tab, silent=False):
+        self._schedule_lsp_completion(tab)
         prefix, items = self._completion_candidates(tab)
         if not items:
             self._hide_completion()
-            self._set_status("No completions")
+            if not silent:
+                self._set_status("No completions")
             return "break"
 
+        self._hide_ai_hint(tab)
         self._hide_completion()
         self.completion_tab = tab
         self.completion_items = items
+        self.completion_signature = self._completion_signature(tab)
         bbox = tab.text.bbox("insert")
         if bbox:
             x, y, width, height = bbox
@@ -4356,9 +5283,12 @@ class LuauIDE:
             font=("Cascadia Code", 10),
         )
         self.completion_listbox.pack(fill=tk.BOTH, expand=True)
+        self.completion_listbox.bind("<ButtonRelease-1>", lambda _e: self._apply_completion())
         self.completion_listbox.bind("<Double-Button-1>", lambda _e: self._apply_completion())
         self.completion_listbox.bind("<Return>", lambda _e: self._apply_completion())
         self.completion_listbox.bind("<Escape>", lambda _e: self._hide_completion())
+        self.completion_listbox.bind("<Down>", lambda _e: self._move_completion_selection(1))
+        self.completion_listbox.bind("<Up>", lambda _e: self._move_completion_selection(-1))
         self._refill_completion_list(items)
         return "break"
 
@@ -4367,31 +5297,64 @@ class LuauIDE:
             return
         self.completion_listbox.delete(0, tk.END)
         for item in items[:100]:
-            self.completion_listbox.insert(tk.END, item)
+            self.completion_listbox.insert(tk.END, item["label"])
         if self.completion_listbox.size():
+            self.completion_listbox.selection_clear(0, tk.END)
             self.completion_listbox.selection_set(0)
+            self.completion_listbox.activate(0)
 
     def _update_completion_items(self, tab):
         prefix, items = self._completion_candidates(tab)
-        if not prefix or not items:
+        context = self._completion_context(tab)
+        if not items or (not prefix and context["kind"] != "member"):
             self._hide_completion()
             return
         self.completion_items = items
+        self.completion_signature = self._completion_signature(tab)
         self._refill_completion_list(items)
+
+    def _move_completion_selection(self, delta):
+        if not self.completion_listbox:
+            return "break"
+        size = self.completion_listbox.size()
+        if size <= 0:
+            return "break"
+        selection = self.completion_listbox.curselection()
+        current = selection[0] if selection else 0
+        target = max(0, min(size - 1, current + delta))
+        self.completion_listbox.selection_clear(0, tk.END)
+        self.completion_listbox.selection_set(target)
+        self.completion_listbox.activate(target)
+        self.completion_listbox.see(target)
+        return "break"
+
+    def _on_completion_up(self, tab):
+        if self.completion_popup and self.completion_tab == tab:
+            return self._move_completion_selection(-1)
+        return None
+
+    def _on_completion_down(self, tab):
+        if self.completion_popup and self.completion_tab == tab:
+            return self._move_completion_selection(1)
+        return None
 
     def _apply_completion(self):
         if not self.completion_popup or not self.completion_tab:
             return "break"
+        tab = self.completion_tab
         selection = self.completion_listbox.curselection()
         if not selection:
             return "break"
-        value = self.completion_listbox.get(selection[0])
-        prefix = self._word_prefix(self.completion_tab)
+        entry = self.completion_items[selection[0]] if selection[0] < len(self.completion_items) else None
+        if not entry:
+            return "break"
+        value = entry["insert_text"]
+        prefix = self._completion_context(tab)["prefix"]
         if prefix:
-            self.completion_tab.text.delete(f"insert-{len(prefix)}c", "insert")
-        self.completion_tab.text.insert("insert", value)
+            tab.text.delete(f"insert-{len(prefix)}c", "insert")
+        tab.text.insert("insert", value)
         self._hide_completion()
-        self.completion_tab.text.focus_set()
+        tab.text.focus_set()
         return "break"
 
     def _hide_completion(self):
@@ -4401,10 +5364,605 @@ class LuauIDE:
         self.completion_listbox = None
         self.completion_items = []
         self.completion_tab = None
+        self.completion_signature = ""
+
+    def _dismiss_editor_assists(self, tab=None):
+        self._hide_completion()
+        self._hide_ai_hint(tab)
+        return "break"
+
+    def _schedule_lsp_completion(self, tab):
+        self._cancel_lsp_completion_job(tab)
+        if not self._lsp_supported_for_tab(tab):
+            return
+        if not self._local_completion_should_popup(tab) and not (self.completion_popup and self.completion_tab == tab):
+            return
+        snapshot = self._build_lsp_completion_snapshot(tab)
+        if not snapshot or not snapshot["uri"]:
+            return
+        signature = snapshot["signature"]
+        tab_id = snapshot["tab_id"]
+        self.lsp_last_signature_by_tab[tab_id] = signature
+        if signature in self.lsp_completion_cache:
+            return
+        self.lsp_completion_jobs[tab_id] = self.root.after(
+            90,
+            lambda current=tab: self._dispatch_lsp_completion_request(current),
+        )
+
+    def _dispatch_lsp_completion_request(self, tab):
+        snapshot = self._build_lsp_completion_snapshot(tab)
+        if not snapshot or snapshot["signature"] != self.lsp_last_signature_by_tab.get(snapshot["tab_id"]):
+            return
+        tab_id = snapshot["tab_id"]
+        self.lsp_completion_jobs.pop(tab_id, None)
+        if snapshot["signature"] in self.lsp_completion_cache:
+            if self.completion_popup and self.completion_tab == tab:
+                self._update_completion_items(tab)
+            return
+        self.lsp_completion_serial += 1
+        serial = self.lsp_completion_serial
+        self.lsp_latest_serial_by_tab[tab_id] = serial
+
+        def worker():
+            entries = []
+            error = ""
+            try:
+                entries = self._request_lsp_completion_entries(snapshot)
+            except Exception as exc:
+                error = str(exc)
+            self.root.after(
+                0,
+                lambda current=tab, current_snapshot=snapshot, current_serial=serial, current_entries=entries, current_error=error: self._handle_lsp_completion_response(
+                    current, current_snapshot, current_serial, current_entries, current_error
+                ),
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_lsp_completion_response(self, tab, snapshot, serial, entries, error):
+        tab_id = snapshot["tab_id"]
+        if self.lsp_latest_serial_by_tab.get(tab_id) != serial:
+            return
+        if error:
+            self._log_info("LSP completion unavailable: %s", error)
+            return
+        self.lsp_completion_cache[snapshot["signature"]] = entries
+        if tab != self._active_tab():
+            return
+        if tab.text.index("insert") != snapshot["insert_index"]:
+            return
+        if self.completion_popup and self.completion_tab == tab:
+            self._update_completion_items(tab)
+        elif self._local_completion_should_popup(tab):
+            self._maybe_show_local_completion(tab)
+
+    def _cancel_ai_completion_job(self, tab):
+        tab_id = str(tab.frame)
+        job = self.ai_completion_jobs.pop(tab_id, None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+
+    def _schedule_ai_completion(self, tab):
+        self._cancel_ai_completion_job(tab)
+        self._hide_ai_hint(tab)
+        trigger_kind = self._ai_trigger_kind(tab)
+        if trigger_kind == "none" or not self._ai_completion_allowed(tab, trigger_kind=trigger_kind):
+            return
+        tab_id = str(tab.frame)
+        debounce_ms = self._ai_debounce_for_trigger(trigger_kind)
+        job = self.root.after(
+            debounce_ms,
+            lambda current=tab: self._dispatch_ai_completion_request(current),
+        )
+        self.ai_completion_jobs[tab_id] = job
+
+    def _ai_trigger_kind(self, tab):
+        if not tab or tab != self._active_tab():
+            return "none"
+        context = self._completion_context(tab)
+        if context["kind"] == "member" or (context["kind"] == "identifier" and len(context["prefix"]) >= AI_WORD_TRIGGER_MIN):
+            return "none"
+        before = tab.text.get("insert linestart", "insert")
+        raw_before = before
+        trimmed = before.rstrip()
+        if not trimmed:
+            return "none"
+        last_char = trimmed[-1]
+        if last_char in "=(":
+            return "expression"
+        if last_char in ",[{":
+            return "argument"
+        if re.search(r"\breturn$", trimmed):
+            return "expression"
+        if re.search(r"\b(?:local\s+[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*)\s*=\s*$", raw_before):
+            return "expression"
+        return "none"
+
+    def _ai_debounce_for_trigger(self, trigger_kind):
+        base = max(120, min(800, int(self.ai_completion_debounce_ms)))
+        if trigger_kind == "member":
+            return min(base, 120)
+        if trigger_kind in {"expression", "argument"}:
+            return min(max(140, base - 40), 220)
+        if trigger_kind == "identifier":
+            return min(max(180, base), 300)
+        if trigger_kind == "word":
+            return min(max(240, base + 40), 380)
+        return base
+
+    def _ai_completion_allowed(self, tab, trigger_kind=None):
+        if not self.ai_completion_enabled or tab != self._active_tab():
+            return False
+        if self.completion_popup and self.completion_tab == tab:
+            return False
+        if tab.multi_cursors or self._selection_range(tab.text):
+            return False
+        if not self._available_ai_providers():
+            return False
+        line = tab.text.get("insert linestart", "insert lineend")
+        if line.lstrip().startswith("--"):
+            return False
+        context = self._completion_context(tab)
+        if context["kind"] == "member" or len(context["prefix"]) >= AI_WORD_TRIGGER_MIN:
+            return False
+        return (trigger_kind or self._ai_trigger_kind(tab)) != "none"
+
+    def _dispatch_ai_completion_request(self, tab):
+        tab_id = str(tab.frame)
+        self.ai_completion_jobs.pop(tab_id, None)
+        if not self._ai_completion_allowed(tab):
+            return
+        snapshot = self._build_ai_context(tab)
+        signature = snapshot["signature"]
+        self.ai_last_signature_by_tab[tab_id] = signature
+        self.ai_request_serial += 1
+        serial = self.ai_request_serial
+        self.ai_latest_serial_by_tab[tab_id] = serial
+        cached = self.ai_completion_cache.get(signature)
+        if cached:
+            provider, completion = cached
+            self._handle_ai_completion_response(tab, snapshot, serial, provider, completion, "")
+            return
+
+        def worker():
+            provider = ""
+            completion = ""
+            error = ""
+            try:
+                provider, completion = self._request_ai_completion(snapshot)
+            except Exception as exc:
+                error = str(exc)
+            self.root.after(
+                0,
+                lambda current=tab, current_snapshot=snapshot, current_serial=serial, ai_provider=provider, ai_text=completion, ai_error=error: self._handle_ai_completion_response(
+                    current, current_snapshot, current_serial, ai_provider, ai_text, ai_error
+                ),
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _build_ai_context(self, tab):
+        insert_index = tab.text.index("insert")
+        insert_offset = int(tab.text.count("1.0", insert_index, "chars")[0])
+        content = tab.text.get("1.0", "end-1c")
+        before_context = content[max(0, insert_offset - AI_CONTEXT_BEFORE_CHARS):insert_offset]
+        after_context = content[insert_offset:insert_offset + AI_CONTEXT_AFTER_CHARS]
+        signature = before_context[-320:] + "\0" + after_context[:120]
+        return {
+            "tab_id": str(tab.frame),
+            "path": str(tab.path) if tab.path else tab.untitled_name,
+            "insert_index": insert_index,
+            "before_context": before_context,
+            "after_context": after_context,
+            "line_prefix": tab.text.get("insert linestart", "insert"),
+            "line_suffix": tab.text.get("insert", "insert lineend"),
+            "signature": signature,
+        }
+
+    def _request_ai_completion(self, snapshot):
+        last_error = "No AI providers are configured."
+        for provider in self._available_ai_providers():
+            try:
+                if provider == "groq":
+                    completion = self._call_groq_completion(snapshot)
+                elif provider == "gemini":
+                    completion = self._call_gemini_completion(snapshot)
+                elif provider == "anthropic":
+                    completion = self._call_anthropic_completion(snapshot)
+                else:
+                    completion = self._call_openai_completion(snapshot)
+                if not completion.strip():
+                    last_error = f"{provider} returned an empty completion."
+                    continue
+                self.ai_provider_cursor = (self.ai_provider_cursor + 1) % 4
+                return provider, completion
+            except RuntimeError as exc:
+                last_error = str(exc)
+                message = last_error.lower()
+                if "429" in message or "rate" in message or "quota" in message or "resource exhausted" in message:
+                    self.ai_provider_backoff_until[provider] = time.time() + self._retry_delay_seconds(last_error, AI_PROVIDER_BACKOFF_SECONDS)
+                elif "403" in message or "1010" in message or "forbidden" in message:
+                    self.ai_provider_backoff_until[provider] = time.time() + AI_PROVIDER_FORBIDDEN_BACKOFF_SECONDS
+                self._log_info("AI completion provider %s failed: %s", provider, exc)
+        raise RuntimeError(last_error)
+
+    def _retry_delay_seconds(self, message, fallback_seconds):
+        retry_match = re.search(r"retry(?: in)? ([0-9]+(?:\.[0-9]+)?)s", message, re.IGNORECASE)
+        if retry_match:
+            return max(float(retry_match.group(1)), 1.0)
+        delay_match = re.search(r'"retryDelay"\s*:\s*"([0-9]+)s"', message)
+        if delay_match:
+            return max(float(delay_match.group(1)), 1.0)
+        return float(fallback_seconds)
+
+    def _ai_prompt_text(self, snapshot):
+        return (
+            "You are a Luau code completion engine.\n"
+            "Complete the code at <CURSOR> using valid Luau syntax only.\n"
+            "Return only the raw text to insert after the cursor.\n"
+            "Do not explain.\n"
+            "Do not describe the code.\n"
+            "Do not restate the prompt.\n"
+            "Do not say things like 'The Luau line', 'Assuming the line is', or 'The continuation would be'.\n"
+            "Do not wrap the answer in markdown, quotes, or backticks.\n"
+            "If no completion is appropriate, return an empty response.\n\n"
+            f"File: {snapshot['path']}\n"
+            f"Before cursor:\n{snapshot['before_context'][-700:]}\n\n"
+            f"Active line:\n{snapshot['line_prefix']}<CURSOR>{snapshot['line_suffix']}\n\n"
+            f"After cursor:\n{snapshot['after_context'][:160]}"
+        )
+
+    def _groq_prompt_text(self, snapshot):
+        return (
+            "You are a Luau code completion engine.\n"
+            "Return only the raw Luau text to insert at <CURSOR>.\n"
+            "No explanation. No prose. No markdown. No quotes.\n\n"
+            f"Before cursor:\n{snapshot['before_context'][-500:]}\n\n"
+            f"Active line:\n{snapshot['line_prefix']}<CURSOR>{snapshot['line_suffix']}\n\n"
+            f"After cursor:\n{snapshot['after_context'][:120]}"
+        )
+
+    def _call_groq_completion(self, snapshot):
+        api_key = self._read_secret("groq")
+        if not api_key:
+            raise RuntimeError("Groq API key is missing.")
+        if GroqClient is None:
+            raise RuntimeError("Groq SDK is unavailable in this build.")
+        try:
+            client = GroqClient(api_key=api_key)
+            response = client.chat.completions.create(
+                model=self.groq_model_name or DEFAULT_GROQ_MODEL,
+                messages=[
+                    {"role": "user", "content": self._groq_prompt_text(snapshot)},
+                ],
+                temperature=0.1,
+                max_completion_tokens=AI_MAX_OUTPUT_TOKENS,
+                top_p=1,
+                stream=False,
+                stop=None,
+            )
+            return self._clean_ai_completion_text(str(response.choices[0].message.content or ""), snapshot)
+        except Exception as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    def _call_gemini_completion(self, snapshot):
+        api_key = self._read_secret("gemini")
+        if not api_key:
+            raise RuntimeError("Gemini API key is missing.")
+        if google_genai is None or google_genai_types is None:
+            raise RuntimeError("Google GenAI SDK is unavailable in this build.")
+        try:
+            client = google_genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=self.gemini_model_name or DEFAULT_GEMINI_MODEL,
+                contents=self._ai_prompt_text(snapshot),
+                config=google_genai_types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=AI_MAX_OUTPUT_TOKENS,
+                    thinking_config=google_genai_types.ThinkingConfig(thinking_budget=0),
+                ),
+            )
+            return self._clean_ai_completion_text(str(response.text or ""), snapshot)
+        except Exception as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    def _call_anthropic_completion(self, snapshot):
+        api_key = self._read_secret("anthropic")
+        if not api_key:
+            raise RuntimeError("Claude API key is missing.")
+        if AnthropicClient is None:
+            raise RuntimeError("Anthropic SDK is unavailable in this build.")
+        try:
+            client = AnthropicClient(api_key=api_key)
+            message = client.messages.create(
+                model=self.anthropic_model_name or DEFAULT_ANTHROPIC_MODEL,
+                max_tokens=AI_MAX_OUTPUT_TOKENS,
+                messages=[{"role": "user", "content": self._ai_prompt_text(snapshot)}],
+            )
+            text = "".join(getattr(block, "text", "") for block in message.content if getattr(block, "type", "") == "text")
+            return self._clean_ai_completion_text(text, snapshot)
+        except Exception as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    def _call_openai_completion(self, snapshot):
+        api_key = self._read_secret("openai")
+        if not api_key:
+            raise RuntimeError("GPT API key is missing.")
+        if OpenAIClient is None:
+            raise RuntimeError("OpenAI SDK is unavailable in this build.")
+        try:
+            client = OpenAIClient(api_key=api_key)
+            response = client.responses.create(
+                model=self.openai_model_name or DEFAULT_OPENAI_MODEL,
+                input=self._ai_prompt_text(snapshot),
+            )
+            text = getattr(response, "output_text", "") or ""
+            return self._clean_ai_completion_text(str(text), snapshot)
+        except Exception as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    def _api_json_request(self, url, payload, headers=None):
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", **(headers or {})},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=AI_API_TIMEOUT_SECONDS) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"{exc.code} {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(str(exc.reason)) from exc
+
+    def _extract_groq_text(self, response):
+        choices = response.get("choices", [])
+        if not choices:
+            return ""
+        message = choices[0].get("message", {})
+        return str(message.get("content", "") or "")
+
+    def _extract_gemini_text(self, response):
+        candidates = response.get("candidates", [])
+        if not candidates:
+            return ""
+        parts = candidates[0].get("content", {}).get("parts", [])
+        return "".join(str(part.get("text", "")) for part in parts)
+
+    def _looks_like_meta_completion_line(self, line):
+        stripped = line.strip()
+        if not stripped:
+            return True
+        lowered = stripped.lower().strip("\"'`")
+        meta_prefixes = (
+            "the luau line",
+            "the lua line",
+            "assuming the line",
+            "assuming ",
+            "the continuation",
+            "continuation:",
+            "continuation would be",
+            "the next line",
+            "the following line",
+            "here is",
+            "here's",
+            "this line",
+            "likely a lua script",
+            "likely a luau script",
+            "active line:",
+            "before cursor:",
+            "after cursor:",
+        )
+        return any(lowered.startswith(prefix) for prefix in meta_prefixes)
+
+    def _strip_ai_meta_lines(self, text):
+        lines = text.splitlines()
+        while lines and self._looks_like_meta_completion_line(lines[0]):
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return "\n".join(lines)
+
+    def _normalized_overlap_text(self, value):
+        return re.sub(r"\s+", "", value or "")
+
+    def _prefix_chars_for_normalized_length(self, text, normalized_length):
+        consumed = 0
+        index = 0
+        while index < len(text) and consumed < normalized_length:
+            if not text[index].isspace():
+                consumed += 1
+            index += 1
+        return index if consumed >= normalized_length else 0
+
+    def _strip_normalized_overlap(self, existing_text, completion_text):
+        normalized_existing = self._normalized_overlap_text(existing_text)
+        normalized_completion = self._normalized_overlap_text(completion_text)
+        if not normalized_existing or not normalized_completion:
+            return completion_text
+        max_overlap = min(len(normalized_existing), len(normalized_completion), 64)
+        for overlap in range(max_overlap, 0, -1):
+            if normalized_existing[-overlap:] == normalized_completion[:overlap]:
+                prefix_chars = self._prefix_chars_for_normalized_length(completion_text, overlap)
+                if prefix_chars:
+                    return completion_text[prefix_chars:].lstrip()
+        return completion_text
+
+    def _strip_ai_overlap_prefix(self, text, snapshot):
+        if not text:
+            return ""
+        candidates = []
+        line_prefix = snapshot.get("line_prefix", "")
+        before_context = snapshot.get("before_context", "")
+        if line_prefix:
+            candidates.append(line_prefix)
+            stripped_prefix = line_prefix.strip()
+            if stripped_prefix and stripped_prefix != line_prefix:
+                candidates.append(stripped_prefix)
+        if before_context:
+            trimmed_before = before_context.rstrip()
+            for size in (80, 48, 24):
+                if len(trimmed_before) >= size:
+                    candidates.append(trimmed_before[-size:])
+
+        seen = set()
+        for candidate in candidates:
+            candidate = candidate or ""
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if text.startswith(candidate):
+                text = text[len(candidate):].lstrip()
+                break
+
+        line_prefix = snapshot.get("line_prefix", "")
+        if line_prefix:
+            text = self._strip_normalized_overlap(line_prefix, text)
+
+        if line_prefix:
+            prefix_word = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*$", line_prefix)
+            if prefix_word:
+                word = prefix_word.group(1)
+                duplicate_pattern = rf"^\s*{re.escape(word)}(?=\s*(?:[=:\.,\[\(\{{]|$))"
+                if re.match(duplicate_pattern, text):
+                    text = re.sub(duplicate_pattern, "", text, count=1).lstrip()
+        return text
+
+    def _clean_ai_completion_text(self, text, snapshot):
+        text = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+        if text.startswith("```"):
+            text = re.sub(r"^```[A-Za-z0-9_+-]*\n?", "", text, count=1)
+            text = re.sub(r"\n?```$", "", text, count=1)
+        text = text.strip("\n")
+        text = self._strip_ai_meta_lines(text)
+        text = self._strip_ai_overlap_prefix(text, snapshot)
+        if not text:
+            return ""
+        lowered = text.lower()
+        blocked_phrases = (
+            "i'm not seeing",
+            "i am not seeing",
+            "however, i can",
+            "if you provide",
+            "for example",
+            "here is",
+            "i can provide",
+            "i can give you",
+            "please provide",
+            "not enough context",
+            "i need more context",
+            "the luau line",
+            "the lua line",
+            "assuming the line",
+            "the continuation would be",
+            "likely a lua script",
+            "likely a luau script",
+        )
+        if any(phrase in lowered for phrase in blocked_phrases):
+            return ""
+        first_line = text.splitlines()[0].strip()
+        if not first_line:
+            return ""
+        line_prefix = snapshot["line_prefix"]
+        if text.startswith(line_prefix):
+            text = text[len(line_prefix):]
+        line_suffix = snapshot.get("line_suffix", "")
+        if line_suffix and text.startswith(line_suffix):
+            return ""
+        if re.match(r"^[A-Za-z][A-Za-z0-9\s,'-]{20,}$", first_line) and not re.search(r"[\(\)\[\]\{\}\.=:_\"'%]", first_line):
+            return ""
+        return text.rstrip()
+
+    def _handle_ai_completion_response(self, tab, snapshot, serial, provider, text, error):
+        tab_id = str(tab.frame)
+        if self.ai_latest_serial_by_tab.get(tab_id) != serial:
+            return
+        if tab != self._active_tab() or not self.ai_completion_enabled:
+            return
+        if tab.text.index("insert") != snapshot["insert_index"]:
+            return
+        if error:
+            self._hide_ai_hint(tab)
+            if tab == self._active_tab():
+                self._set_status("AI completion unavailable")
+            return
+        if text:
+            self.ai_completion_cache[snapshot["signature"]] = (provider, text)
+        self._show_ai_hint(tab, text, provider, serial)
+
+    def _show_ai_hint(self, tab, text, provider, serial):
+        self._hide_ai_hint(tab)
+        if not text:
+            return
+        insert_index = tab.text.index("insert")
+        was_loaded = tab.loaded
+        was_modified = tab.text.edit_modified()
+        tab.loaded = False
+        try:
+            tab.text.insert(insert_index, text, ("ai_hint_inline",))
+            end_index = tab.text.index(f"{insert_index}+{len(text)}c")
+            tab.text.tag_add("ai_hint_inline", insert_index, end_index)
+            tab.text.mark_set(tk.INSERT, insert_index)
+            tab.text.edit_modified(was_modified)
+        finally:
+            tab.loaded = was_loaded
+        self._update_line_numbers(tab)
+        self.ai_hint_label = None
+        self.ai_hint_tab = tab
+        self.ai_hint_text = text
+        self.ai_hint_full_text = text
+        self.ai_hint_insert_index = insert_index
+        self.ai_hint_end_index = end_index
+        self.ai_hint_request_serial = serial
+
+    def _hide_ai_hint(self, tab=None):
+        if tab is not None and self.ai_hint_tab is not None and self.ai_hint_tab is not tab:
+            return
+        if self.ai_hint_tab and self.ai_hint_insert_index and self.ai_hint_end_index:
+            was_loaded = self.ai_hint_tab.loaded
+            was_modified = self.ai_hint_tab.text.edit_modified()
+            self.ai_hint_tab.loaded = False
+            try:
+                self.ai_hint_tab.text.delete(self.ai_hint_insert_index, self.ai_hint_end_index)
+                self.ai_hint_tab.text.edit_modified(was_modified)
+            except tk.TclError:
+                pass
+            finally:
+                self.ai_hint_tab.loaded = was_loaded
+            self._update_line_numbers(self.ai_hint_tab)
+        self.ai_hint_label = None
+        self.ai_hint_tab = None
+        self.ai_hint_text = ""
+        self.ai_hint_full_text = ""
+        self.ai_hint_insert_index = ""
+        self.ai_hint_end_index = ""
+
+    def _accept_ai_hint(self, tab):
+        if self.ai_hint_tab != tab or not self.ai_hint_full_text:
+            return None
+        full_text = self.ai_hint_full_text
+        if tab.text.index("insert") != self.ai_hint_insert_index:
+            self._hide_ai_hint(tab)
+            return None
+        self._hide_ai_hint(tab)
+        tab.text.insert("insert", full_text)
+        self._update_line_numbers(tab)
+        self._schedule_highlight(tab)
+        self._schedule_diagnostics(tab)
+        return "break"
 
     def _on_editor_tab_key(self, tab, event):
         if self.completion_popup and tab == self.completion_tab:
             return self._apply_completion()
+        accepted = self._accept_ai_hint(tab)
+        if accepted:
+            return accepted
         selection = self._selection_range(tab.text)
         if selection:
             return self._indent_selection_or_line(tab)

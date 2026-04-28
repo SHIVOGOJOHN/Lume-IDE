@@ -27,11 +27,22 @@ if defined LUAU_SOURCE (
   set "LUAU_FLAG=--include-data-files=%LUAU_SOURCE%=luau.exe"
 )
 
+python -c "import groq, google.genai, anthropic, openai" >nul 2>&1
+if errorlevel 1 (
+  echo Missing Python SDK dependencies. Install with:
+  echo   python -m pip install groq google-genai anthropic openai
+  exit /b 1
+)
+
 python -m nuitka ^
   --standalone ^
   --onefile ^
   --enable-plugin=tk-inter ^
   --assume-yes-for-downloads ^
+  --include-package=groq ^
+  --include-package=google.genai ^
+  --include-package=anthropic ^
+  --include-package=openai ^
   --windows-console-mode=disable ^
   --windows-icon-from-ico=%ICON% ^
   --output-filename=%OUTPUT% ^
